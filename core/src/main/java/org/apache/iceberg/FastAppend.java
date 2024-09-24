@@ -30,6 +30,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.CharSequenceSet;
 
 /**
@@ -41,9 +42,8 @@ import org.apache.iceberg.util.CharSequenceSet;
 class FastAppend extends SnapshotProducer<AppendFiles> implements AppendFiles {
   private final String tableName;
   private final TableOperations ops;
-  private final PartitionSpec spec;
   private final SnapshotSummary.Builder summaryBuilder = SnapshotSummary.builder();
-  private final List<DataFile> newFiles = Lists.newArrayList();
+  private final Map<PartitionSpec, List<DataFile>> newDataFilesBySpec = Maps.newHashMap();
   private final CharSequenceSet newFilePaths = CharSequenceSet.empty();
   private final List<ManifestFile> appendManifests = Lists.newArrayList();
   private final List<ManifestFile> rewrittenAppendManifests = Lists.newArrayList();
@@ -54,7 +54,6 @@ class FastAppend extends SnapshotProducer<AppendFiles> implements AppendFiles {
     super(ops);
     this.tableName = tableName;
     this.ops = ops;
-    this.spec = ops.current().spec();
   }
 
   @Override
@@ -87,9 +86,17 @@ class FastAppend extends SnapshotProducer<AppendFiles> implements AppendFiles {
   public FastAppend appendFile(DataFile file) {
     Preconditions.checkNotNull(file, "Invalid data file: null");
     if (newFilePaths.add(file.path())) {
+      PartitionSpec fileSpec = ops.current().spec(file.specId());
+      Preconditions.checkArgument(
+              fileSpec != null,
+              "Cannot find partition spec %s for data file: %s",
+              file.specId(),
+              file.path());
       this.hasNewFiles = true;
-      newFiles.add(file);
-      summaryBuilder.addedFile(spec, file);
+      List<DataFile> newDataFiles =
+              newDataFilesBySpec.computeIfAbsent(fileSpec, ignored -> Lists.newArrayList());
+      newDataFiles.add(file);
+      summaryBuilder.addedFile(fileSpec, file);
     }
 
     return this;
