@@ -1501,7 +1501,7 @@ public class TestRewriteDataFilesAction extends TestBase {
     table.refresh();
 
     // write data
-    writeRecords(4, SCALE);
+    writeRecords(4, 100000);
     table.refresh();
 
     long count = currentData().size();
