@@ -51,7 +51,11 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.PlanningMode;
 import org.apache.iceberg.RowLevelOperationMode;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
@@ -324,6 +328,48 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
         "Should have expected rows",
         ImmutableList.of(row(1, "invalid")),
         sql("SELECT * FROM %s", selectTarget()));
+  }
+
+  @TestTemplate
+  public void myRandomExperimentTest() throws Exception {
+    // Skip non-Parquet formats for this test
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    // Because of this thread-local hack, this fails in distributed planning mode
+    assumeThat(planningMode).isEqualTo(PlanningMode.LOCAL);
+
+    this.formatVersion = 4;
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(1);
+
+    sql("UPDATE %s AS t SET t.dep = 'some_updated_value'", commitTarget());
+
+    table.refresh();
+    assertThat(table.snapshots()).as("Should have 2 snapshots").hasSize(2);
+
+    List<ManifestFile> manifests = table.currentSnapshot().allManifests(table.io());
+    assertThat(manifests).hasSize(1);
+
+    ManifestFile manifest = manifests.get(0);
+
+    try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+      DataFile dataFile = Iterables.getOnlyElement(reader);
+
+      assertThat(dataFile.columnUpdateDetails())
+          .as("Column update metadata should be set")
+          .isNotNull()
+          .isNotEmpty();
+    }
+
+    assertEquals(
+        "Should have expected rows with updated dep column",
+        ImmutableList.of(row(1, "some_updated_value"), row(2, "some_updated_value")),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
   }
 
   @TestTemplate
