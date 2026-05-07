@@ -21,10 +21,6 @@ package org.apache.iceberg.spark.source;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 import org.apache.iceberg.ColumnUpdate;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
@@ -33,6 +29,7 @@ import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DataWriteResult;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.FileWriter;
@@ -41,9 +38,6 @@ import org.apache.iceberg.io.RollingDataWriter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.spark.SparkWriteConf;
-import org.apache.iceberg.spark.SparkWriteRequirements;
-import org.apache.iceberg.types.Types;
-import org.apache.iceberg.util.DataFileSet;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
@@ -54,83 +48,61 @@ import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.SortDirection;
 import org.apache.spark.sql.connector.expressions.SortOrder;
-import org.apache.spark.sql.connector.write.BatchWrite;
-import org.apache.spark.sql.connector.write.DataWriter;
-import org.apache.spark.sql.connector.write.DataWriterFactory;
+import org.apache.spark.sql.connector.write.DeltaBatchWrite;
+import org.apache.spark.sql.connector.write.DeltaWrite;
+import org.apache.spark.sql.connector.write.DeltaWriter;
+import org.apache.spark.sql.connector.write.DeltaWriterFactory;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
 import org.apache.spark.sql.connector.write.RequiresDistributionAndOrdering;
-import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriteSummary;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class SparkColumnUpdateWrite extends BaseSparkWrite
-    implements Write, RequiresDistributionAndOrdering {
+class SparkColumnUpdateWrite implements DeltaWrite, RequiresDistributionAndOrdering {
   private static final Logger LOG = LoggerFactory.getLogger(SparkColumnUpdateWrite.class);
 
+  private static final NamedReference FILE_PATH_REF =
+      Expressions.column(MetadataColumns.FILE_PATH.name());
+
   private final JavaSparkContext sparkContext;
-  private final SparkCopyOnWriteScan scan;
   private final SparkWriteConf writeConf;
   private final Table table;
   private final String queryId;
   private final FileFormat format;
-  private final String applicationId;
-  private final boolean wapEnabled;
-  private final String wapId;
   private final int outputSpecId;
-  private final String branch;
   private final long targetFileSize;
   private final Schema writeSchema;
   private final StructType dsSchema;
-  private final Map<String, String> extraSnapshotMetadata;
-  private final boolean useFanoutWriter;
-  private final SparkWriteRequirements writeRequirements;
   private final Map<String, String> writeProperties;
-  private final Set<String> updatedColumns;
-
-  private boolean cleanupOnAbort = false;
+  private final List<Integer> updatedFieldIds;
 
   SparkColumnUpdateWrite(
       SparkSession spark,
-      SparkCopyOnWriteScan scan,
       Table table,
       SparkWriteConf writeConf,
       LogicalWriteInfo writeInfo,
       String applicationId,
       Schema writeSchema,
       StructType dsSchema,
-      SparkWriteRequirements writeRequirements,
-      Set<String> updatedColumns) {
+      List<Integer> updatedFieldIds) {
     this.sparkContext = JavaSparkContext.fromSparkContext(spark.sparkContext());
-    this.scan = scan;
     this.table = table;
     this.writeConf = writeConf;
     this.queryId = writeInfo.queryId();
     this.format = writeConf.dataFileFormat();
-    this.applicationId = applicationId;
-    this.wapEnabled = writeConf.wapEnabled();
-    this.wapId = writeConf.wapId();
-    this.branch = writeConf.branch();
+    this.outputSpecId = writeConf.outputSpecId();
     this.targetFileSize = writeConf.targetDataFileSize();
     this.writeSchema = writeSchema;
     this.dsSchema = dsSchema;
-    this.extraSnapshotMetadata = writeConf.extraSnapshotMetadata();
-    this.useFanoutWriter = writeConf.useFanoutWriter(writeRequirements);
-    this.writeRequirements = writeRequirements;
-    this.outputSpecId = writeConf.outputSpecId();
     this.writeProperties = writeConf.writeProperties();
-    this.updatedColumns = updatedColumns;
+    this.updatedFieldIds = updatedFieldIds;
   }
-
-  private static final NamedReference FILE_PATH_REF =
-      Expressions.column(MetadataColumns.FILE_PATH.name());
 
   @Override
   public Distribution requiredDistribution() {
-    // Cluster by FILE_PATH to ensure all rows for the same base file go to the same partition
     Distribution distribution = Distributions.clustered(new NamedReference[] {FILE_PATH_REF});
     LOG.debug("Requesting {} as write distribution for table {}", distribution, table.name());
     return distribution;
@@ -138,57 +110,53 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
 
   @Override
   public SortOrder[] requiredOrdering() {
-    // Sort by FILE_PATH to ensure rows for the same base file are contiguous
     SortOrder[] ordering =
         new SortOrder[] {Expressions.sort(FILE_PATH_REF, SortDirection.ASCENDING)};
     LOG.debug("Requesting {} as write ordering for table {}", ordering, table.name());
     return ordering;
   }
 
-  private DataFileSet baseFiles() {
-    if (scan == null) {
-      return DataFileSet.create();
-    } else {
-      return scan.tasks().stream()
-          .map(FileScanTask::file)
-          .collect(Collectors.toCollection(DataFileSet::create));
+  @Override
+  public DeltaBatchWrite toBatch() {
+    return new ColumnUpdateDeltaBatchWrite(updatedFieldIds);
+  }
+
+  private Map<String, DataFile> baseFilesByPath() {
+    Map<String, DataFile> result = Maps.newHashMap();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        result.put(task.file().location(), task.file());
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to scan base files for column update commit", e);
     }
+    return result;
   }
 
   private Map<String, DataFile> writtenFiles(WriterCommitMessage[] messages) {
     Map<String, DataFile> result = Maps.newHashMap();
-
     for (WriterCommitMessage message : messages) {
       if (message != null) {
         TaskCommit taskCommit = (TaskCommit) message;
         result.putAll(taskCommit.updateFilesByBasePath());
       }
     }
-
     return result;
   }
 
-  @Override
-  public BatchWrite toBatch() {
-    return new ColumnUpdateOperation(scan, updatedColumns);
-  }
+  private class ColumnUpdateDeltaBatchWrite implements DeltaBatchWrite {
 
-  private class ColumnUpdateOperation implements BatchWrite {
-    private final SparkCopyOnWriteScan scan;
-    private final Set<String> updatedColumns;
+    private final List<Integer> updatedFieldIds;
 
-    private ColumnUpdateOperation(SparkCopyOnWriteScan scan, Set<String> updatedColumns) {
-      this.scan = scan;
-      this.updatedColumns = updatedColumns;
+    ColumnUpdateDeltaBatchWrite(List<Integer> updatedFieldIds) {
+      this.updatedFieldIds = updatedFieldIds;
     }
 
-    // TODO gaborkaszab: copy-paste from SparkWrite
     @Override
-    public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
-      // broadcast the table metadata as the writer factory will be sent to executors
+    public DeltaWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
       Broadcast<Table> tableBroadcast =
           sparkContext.broadcast(SerializableTableWithSize.copyOf(table));
-      return new ColumnUpdateWriteFactory(
+      return new ColumnUpdateDeltaWriterFactory(
           tableBroadcast,
           queryId,
           format,
@@ -196,7 +164,6 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
           targetFileSize,
           writeSchema,
           dsSchema,
-          useFanoutWriter,
           writeProperties);
     }
 
@@ -207,12 +174,10 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
 
     @Override
     public void abort(WriterCommitMessage[] messages) {
-      // TODO gaborkaszab: implement
-    }
-
-    @Override
-    public String toString() {
-      return String.format("SparkColumnUpdateWrite(table=%s, format=%s)", table, format);
+      Map<String, DataFile> writtenFiles = writtenFiles(messages);
+      for (DataFile file : writtenFiles.values()) {
+        table.io().deleteFile(file.location());
+      }
     }
 
     @Override
@@ -222,39 +187,19 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
 
     @Override
     public void commit(WriterCommitMessage[] messages, WriteSummary summary) {
-      List<Integer> updatedFieldIds =
-          table.schema().columns().stream()
-              .filter(field -> updatedColumns.contains(field.name()))
-              .map(Types.NestedField::fieldId)
-              .toList();
-      // TODO gaborkaszab: fail if not all col names have field IDs in the table
-
-      DataFileSet baseFiles = baseFiles();
-
-      // Create a mapping from base file path to base file for quick lookup
-      Map<String, DataFile> baseFilesByPath =
-          baseFiles.stream()
-              .collect(Collectors.toMap(file -> file.location(), Function.identity()));
-
+      Map<String, DataFile> baseFilesByPath = baseFilesByPath();
       Map<String, DataFile> writtenFiles = writtenFiles(messages);
-      // TODO gaborkaszab: check that all data files have a new update file
 
-      // Create mapping from base file to update file
       Map<DataFile, DataFile> baseToUpdateFile = Maps.newHashMap();
-      for (Map.Entry<String, DataFile> updateFile : writtenFiles.entrySet()) {
-        // TODO gaborkaszab: temp workaround for testing, works only if there is a single base file
-        Map.Entry<String, DataFile> anotherUpdateFile =
-            Map.entry(baseFiles.iterator().next().location(), updateFile.getValue());
+      for (Map.Entry<String, DataFile> entry : writtenFiles.entrySet()) {
+        String basePath = entry.getKey();
+        DataFile updateFile = entry.getValue();
         Preconditions.checkState(
-            baseFilesByPath.containsKey(anotherUpdateFile.getKey()),
-            "Update file references unknown base file ",
-            anotherUpdateFile.getKey());
-
-        baseToUpdateFile.put(
-            baseFilesByPath.get(anotherUpdateFile.getKey()), anotherUpdateFile.getValue());
+            baseFilesByPath.containsKey(basePath),
+            "Update file references unknown base file: %s",
+            basePath);
+        baseToUpdateFile.put(baseFilesByPath.get(basePath), updateFile);
       }
-
-      // TODO gaborkaszab: conflict detection with isolationLevel similar to CoWOperation?
 
       ColumnUpdate columnUpdate = table.newColumnUpdate().withFieldIds(updatedFieldIds);
       baseToUpdateFile.forEach(columnUpdate::addColumnUpdate);
@@ -262,13 +207,11 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
     }
   }
 
-  public static class TaskCommit implements WriterCommitMessage {
-    // Maps base file path to the update file written for that base file
+  static class TaskCommit implements WriterCommitMessage {
     private final Map<String, DataFile> updateFilesByBasePath;
 
     TaskCommit(Map<String, DataFile> result) {
-      this.updateFilesByBasePath = Maps.newHashMap();
-      this.updateFilesByBasePath.putAll(result);
+      this.updateFilesByBasePath = Maps.newHashMap(result);
     }
 
     Map<String, DataFile> updateFilesByBasePath() {
@@ -276,19 +219,17 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
     }
   }
 
-  // TODO gaborkaszab: copy-paste from SparkWrite. See what's indeed needed
-  private static class ColumnUpdateWriteFactory implements DataWriterFactory {
+  private static class ColumnUpdateDeltaWriterFactory implements DeltaWriterFactory {
     private final Broadcast<Table> tableBroadcast;
+    private final String queryId;
     private final FileFormat format;
     private final int outputSpecId;
     private final long targetFileSize;
     private final Schema writeSchema;
     private final StructType dsSchema;
-    private final boolean useFanoutWriter;
-    private final String queryId;
     private final Map<String, String> writeProperties;
 
-    protected ColumnUpdateWriteFactory(
+    ColumnUpdateDeltaWriterFactory(
         Broadcast<Table> tableBroadcast,
         String queryId,
         FileFormat format,
@@ -296,21 +237,19 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
         long targetFileSize,
         Schema writeSchema,
         StructType dsSchema,
-        boolean useFanoutWriter,
         Map<String, String> writeProperties) {
       this.tableBroadcast = tableBroadcast;
+      this.queryId = queryId;
       this.format = format;
       this.outputSpecId = outputSpecId;
       this.targetFileSize = targetFileSize;
       this.writeSchema = writeSchema;
       this.dsSchema = dsSchema;
-      this.useFanoutWriter = useFanoutWriter;
-      this.queryId = queryId;
       this.writeProperties = writeProperties;
     }
 
     @Override
-    public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
+    public DeltaWriter<InternalRow> createWriter(int partitionId, long taskId) {
       Table table = tableBroadcast.value();
       PartitionSpec spec = table.specs().get(outputSpecId);
       FileIO io = table.io();
@@ -330,119 +269,94 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
               .writeProperties(writeProperties)
               .build();
 
-      /* Function<InternalRow, InternalRow> rowLineageExtractor = new ExtractRowLineage(writeSchema);
-
-      if (spec.isUnpartitioned()) {
-        return new SparkWrite.UnpartitionedDataWriter(
-            writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
-
-      } else {
-        return new SparkWrite.PartitionedDataWriter(
-            writerFactory,
-            fileFactory,
-            io,
-            spec,
-            writeSchema,
-            dsSchema,
-            targetFileSize,
-            useFanoutWriter,
-            rowLineageExtractor);
-      }*/
-
-      return new ColumnUpdateDataWriter(
-          writerFactory, fileFactory, io, spec, targetFileSize, dsSchema);
+      return new ColumnUpdateDeltaWriter(writerFactory, fileFactory, io, spec, targetFileSize);
     }
   }
 
-  // TODO gaborkaszab: the issue with this class is that the FILE_PATH is not part of the schema.
-  // Commented the code that get's the file path from the row and opens a new writer if we read a
-  // new file path.
-  // Works as a very basic writer now.
-  private static class ColumnUpdateDataWriter implements DataWriter<InternalRow> {
+  private static class ColumnUpdateDeltaWriter implements DeltaWriter<InternalRow> {
+    private static final int FILE_PATH_ORDINAL = 0; // ordinal in the id row
+    private static final int ROW_POSITION_ORDINAL = 1; // ordinal in the id row
+
     private final SparkFileWriterFactory writerFactory;
     private final OutputFileFactory fileFactory;
     private final FileIO io;
     private final PartitionSpec spec;
     private final long targetFileSizeInBytes;
-    private final int filePathOrdinal = 1;
 
-    private FileWriter<InternalRow, DataWriteResult> currentWriter;
-    private String currentFilePath;
-    private boolean closed;
+    private FileWriter<InternalRow, DataWriteResult> currentWriter = null;
+    private String currentFilePath = null;
+    private boolean closed = false;
 
-    private final Map<String, DataFile> updateFilesByBasePath;
+    private final Map<String, DataFile> updateFilesByBasePath = Maps.newHashMap();
 
-    private ColumnUpdateDataWriter(
+    ColumnUpdateDeltaWriter(
         SparkFileWriterFactory writerFactory,
         OutputFileFactory fileFactory,
         FileIO io,
         PartitionSpec spec,
-        long targetFileSize,
-        StructType dsSchema) {
+        long targetFileSize) {
       this.writerFactory = writerFactory;
       this.fileFactory = fileFactory;
       this.io = io;
       this.spec = spec;
       this.targetFileSizeInBytes = targetFileSize;
-      // this.filePathOrdinal = dsSchema.fieldIndex(MetadataColumns.FILE_PATH.name());
-      this.updateFilesByBasePath = Maps.newHashMap();
-      this.closed = false;
     }
 
     @Override
-    public void write(InternalRow record) throws IOException {
-      String filePath = record.getString(filePathOrdinal);
+    public void update(InternalRow meta, InternalRow id, InternalRow row) throws IOException {
+      String filePath = id.getString(FILE_PATH_ORDINAL);
+      long pos = id.getLong(ROW_POSITION_ORDINAL);
 
-      if (currentWriter == null /*|| !filePath.equals(currentFilePath)*/) {
-        openWriter(filePath);
+      if (!filePath.equals(currentFilePath)) {
+        // rows are sorted by FILE_PATH so a path change means we've moved to a new base file
+        closeCurrentWriter();
+        currentFilePath = filePath;
+        currentWriter =
+            new RollingDataWriter<>(
+                writerFactory, fileFactory, io, targetFileSizeInBytes, spec, null);
       }
 
-      currentWriter.write(record);
+      // Write _pos as the first column followed by the assigned column values
+      currentWriter.write(new ColumnUpdateRow(pos, row));
     }
 
-    // TODO gaborkaszab: consider creating DataWriter here instead of RollingDataWriter
-    private void openWriter(String filePath) throws IOException {
-      closeCurrentWriter();
+    @Override
+    public void delete(InternalRow meta, InternalRow id) {
+      throw new UnsupportedOperationException("Column update does not delete rows");
+    }
 
-      currentWriter =
-          new RollingDataWriter<>(
-              writerFactory, fileFactory, io, targetFileSizeInBytes, spec, null);
-      currentFilePath = filePath;
+    @Override
+    public void insert(InternalRow row) {
+      throw new UnsupportedOperationException("Column update does not insert rows");
     }
 
     private void closeCurrentWriter() throws IOException {
       if (currentWriter != null) {
         currentWriter.close();
-
         DataWriteResult result = currentWriter.result();
-        if (result.dataFiles().isEmpty()) {
-          throw new IllegalStateException(
-              "Unable to create update file for base file " + currentFilePath);
-        }
-        if (result.dataFiles().size() > 1) {
-          throw new IllegalStateException(
-              "Multiple update files created for base file " + currentFilePath);
-        }
-        currentFilePath = UUID.randomUUID().toString(); // TODO gaborkaszab: remove this
-        updateFilesByBasePath.put(currentFilePath, result.dataFiles().getFirst());
-
-        this.currentWriter = null;
-        this.currentFilePath = null;
+        Preconditions.checkState(
+            !result.dataFiles().isEmpty(),
+            "No update file written for base file: %s",
+            currentFilePath);
+        Preconditions.checkState(
+            result.dataFiles().size() == 1,
+            "Multiple update files written for base file: %s",
+            currentFilePath);
+        updateFilesByBasePath.put(currentFilePath, result.dataFiles().get(0));
+        currentWriter = null;
+        currentFilePath = null;
       }
     }
 
     @Override
     public WriterCommitMessage commit() throws IOException {
       close();
-
       return new TaskCommit(updateFilesByBasePath);
     }
 
     @Override
     public void abort() throws IOException {
       close();
-
-      // Cleanup written files on abort
       for (DataFile file : updateFilesByBasePath.values()) {
         io.deleteFile(file.location());
       }
@@ -454,6 +368,137 @@ public class SparkColumnUpdateWrite extends BaseSparkWrite
         closeCurrentWriter();
         closed = true;
       }
+    }
+  }
+
+  /**
+   * A zero-copy InternalRow that prepends a _pos (long) value before the delegate row's fields.
+   *
+   * <p>Ordinal 0 returns the row position; ordinals 1..N delegate to the wrapped row at ordinal-1.
+   * This follows the same pattern as Spark's JoinedRow.
+   */
+  static class ColumnUpdateRow extends InternalRow {
+    private final long pos;
+    private final InternalRow delegate;
+
+    ColumnUpdateRow(long pos, InternalRow delegate) {
+      this.pos = pos;
+      this.delegate = delegate;
+    }
+
+    @Override
+    public int numFields() {
+      return 1 + delegate.numFields();
+    }
+
+    @Override
+    public boolean isNullAt(int ordinal) {
+      return ordinal == 0 ? false : delegate.isNullAt(ordinal - 1);
+    }
+
+    @Override
+    public boolean getBoolean(int ordinal) {
+      return delegate.getBoolean(ordinal - 1);
+    }
+
+    @Override
+    public byte getByte(int ordinal) {
+      return ordinal == 0 ? (byte) pos : delegate.getByte(ordinal - 1);
+    }
+
+    @Override
+    public short getShort(int ordinal) {
+      return ordinal == 0 ? (short) pos : delegate.getShort(ordinal - 1);
+    }
+
+    @Override
+    public int getInt(int ordinal) {
+      return ordinal == 0 ? (int) pos : delegate.getInt(ordinal - 1);
+    }
+
+    @Override
+    public long getLong(int ordinal) {
+      return ordinal == 0 ? pos : delegate.getLong(ordinal - 1);
+    }
+
+    @Override
+    public float getFloat(int ordinal) {
+      return delegate.getFloat(ordinal - 1);
+    }
+
+    @Override
+    public double getDouble(int ordinal) {
+      return delegate.getDouble(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.sql.types.Decimal getDecimal(int ordinal, int precision, int scale) {
+      return delegate.getDecimal(ordinal - 1, precision, scale);
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.UTF8String getUTF8String(int ordinal) {
+      return delegate.getUTF8String(ordinal - 1);
+    }
+
+    @Override
+    public byte[] getBinary(int ordinal) {
+      return delegate.getBinary(ordinal - 1);
+    }
+
+    @Override
+    public InternalRow getStruct(int ordinal, int numFields) {
+      return delegate.getStruct(ordinal - 1, numFields);
+    }
+
+    @Override
+    public org.apache.spark.sql.catalyst.util.ArrayData getArray(int ordinal) {
+      return delegate.getArray(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.sql.catalyst.util.MapData getMap(int ordinal) {
+      return delegate.getMap(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.VariantVal getVariant(int ordinal) {
+      return delegate.getVariant(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.CalendarInterval getInterval(int ordinal) {
+      return delegate.getInterval(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.GeographyVal getGeography(int ordinal) {
+      return delegate.getGeography(ordinal - 1);
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.GeometryVal getGeometry(int ordinal) {
+      return delegate.getGeometry(ordinal - 1);
+    }
+
+    @Override
+    public Object get(int ordinal, org.apache.spark.sql.types.DataType dataType) {
+      return ordinal == 0 ? pos : delegate.get(ordinal - 1, dataType);
+    }
+
+    @Override
+    public InternalRow copy() {
+      return new ColumnUpdateRow(pos, delegate.copy());
+    }
+
+    @Override
+    public void setNullAt(int ordinal) {
+      throw new UnsupportedOperationException("ColumnUpdateRow is read-only");
+    }
+
+    @Override
+    public void update(int ordinal, Object value) {
+      throw new UnsupportedOperationException("ColumnUpdateRow is read-only");
     }
   }
 }

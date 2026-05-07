@@ -16,24 +16,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.spark.sql.catalyst.analysis
+package org.apache.iceberg.spark.source;
+
+import org.apache.iceberg.types.Types;
 
 /**
- * Thread-local context to pass updated column names from optimizer to write builder.
- * Used for column-update mode to track which columns are being updated.
+ * Constants for sparse column update files.
+ *
+ * <p>The {@code _pos} column in update files uses a regular field ID (not a metadata column ID) so
+ * the Parquet reader reads the actual stored values instead of generating synthetic positions.
  */
-object ColumnUpdateContext {
-  private val updatedColumns = new ThreadLocal[Set[String]]()
+public class SparseColumnUpdateJoinReader {
 
-  def setUpdatedColumns(columns: Set[String]): Unit = {
-    updatedColumns.set(columns)
-  }
+  public static final int STORED_POS_FIELD_ID =
+      2147483545; // Integer.MAX_VALUE - 102, avoids metadata range
+  public static final Types.NestedField STORED_POS_FIELD =
+      Types.NestedField.required(STORED_POS_FIELD_ID, "_pos", Types.LongType.get());
 
-  def getUpdatedColumns: Set[String] = {
-    Option(updatedColumns.get()).getOrElse(Set.empty)
-  }
-
-  def clear(): Unit = {
-    updatedColumns.remove()
-  }
+  private SparseColumnUpdateJoinReader() {}
 }

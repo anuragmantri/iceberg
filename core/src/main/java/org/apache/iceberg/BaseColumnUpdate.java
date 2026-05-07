@@ -25,6 +25,8 @@ import java.util.Set;
 import org.apache.iceberg.events.CreateSnapshotEvent;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -244,7 +246,8 @@ public class BaseColumnUpdate extends SnapshotProducer<ColumnUpdate> implements 
         DataFiles.builder(ops().current().spec())
             .copy(existingFile)
             .withColumnUpdates(
-                nonOverlappingColumnUpdates(existingFile.columnUpdateDetails(), columnUpdateFile))
+                nonOverlappingColumnUpdates(
+                    existingFile.columnUpdateDetails(), columnUpdateFile, existingFile))
             .withMetrics(mergeMetrics(existingFile, columnUpdateFile))
             .build();
 
@@ -283,24 +286,84 @@ public class BaseColumnUpdate extends SnapshotProducer<ColumnUpdate> implements 
   }
 
   private List<ContentFile.ColumnUpdateDetails> nonOverlappingColumnUpdates(
-      List<ContentFile.ColumnUpdateDetails> existingUpdates, DataFile updateFile) {
-    ContentFile.ColumnUpdateDetails newColumnUpdateDetails =
-        BaseFile.BaseColumnUpdateDetails.of(fieldIds, updateFile.location());
-
+      List<ContentFile.ColumnUpdateDetails> existingUpdates,
+      DataFile updateFile,
+      DataFile baseFile) {
     if (existingUpdates == null) {
-      return List.of(newColumnUpdateDetails);
+      return List.of(BaseFile.BaseColumnUpdateDetails.of(fieldIds, updateFile.location()));
     }
 
-    List<ContentFile.ColumnUpdateDetails> result = Lists.newArrayList();
-    for (ContentFile.ColumnUpdateDetails existingUpdate : existingUpdates) {
-      List<Integer> nonOverlappingFiledIds = existingUpdate.fieldIds();
-      nonOverlappingFiledIds.removeAll(fieldIds);
-      if (!nonOverlappingFiledIds.isEmpty()) {
-        result.add(
-            BaseFile.BaseColumnUpdateDetails.of(nonOverlappingFiledIds, existingUpdate.filePath()));
+    // Detect overlapping field IDs
+    Set<Integer> newFieldIdSet = Sets.newHashSet(fieldIds);
+    Set<Integer> overlappingFieldIds = Sets.newHashSet();
+    for (ContentFile.ColumnUpdateDetails existing : existingUpdates) {
+      for (int existingFieldId : existing.fieldIds()) {
+        if (newFieldIdSet.contains(existingFieldId)) {
+          overlappingFieldIds.add(existingFieldId);
+        }
       }
     }
-    result.add(newColumnUpdateDetails);
+
+    if (overlappingFieldIds.isEmpty()) {
+      // No overlap — simple append
+      List<ContentFile.ColumnUpdateDetails> result = Lists.newArrayList(existingUpdates);
+      result.add(BaseFile.BaseColumnUpdateDetails.of(fieldIds, updateFile.location()));
+      return result;
+    }
+
+    // Overlap detected — merge each overlapping column into its own file
+    Schema tableSchema = ops().current().schema();
+    PartitionSpec spec = ops().current().spec();
+
+    List<ContentFile.ColumnUpdateDetails> result = Lists.newArrayList();
+
+    // For each overlapping field, find the old file that has it and merge
+    for (int overlapFieldId : overlappingFieldIds) {
+      String oldFilePath = null;
+      for (ContentFile.ColumnUpdateDetails existing : existingUpdates) {
+        if (existing.fieldIds().contains(overlapFieldId)) {
+          oldFilePath = existing.filePath();
+          break;
+        }
+      }
+
+      InputFile oldInputFile = ops().io().newInputFile(oldFilePath);
+      InputFile newInputFile = ops().io().newInputFile(updateFile.location());
+      String mergedFileName =
+          "merged-col-" + overlapFieldId + "-" + java.util.UUID.randomUUID() + ".parquet";
+      String tableLocation = ops().current().location();
+      OutputFile mergedOutputFile =
+          ops().io().newOutputFile(tableLocation + "/data/" + mergedFileName);
+
+      DataFile mergedFile =
+          ColumnUpdateMerger.mergeColumn(
+              oldInputFile,
+              newInputFile,
+              overlapFieldId,
+              tableSchema,
+              mergedOutputFile,
+              spec,
+              baseFile.partition());
+
+      result.add(
+          BaseFile.BaseColumnUpdateDetails.of(List.of(overlapFieldId), mergedFile.location()));
+    }
+
+    // Add non-overlapping fields from existing entries
+    for (ContentFile.ColumnUpdateDetails existing : existingUpdates) {
+      List<Integer> remaining = Lists.newArrayList(existing.fieldIds());
+      remaining.removeAll(overlappingFieldIds);
+      if (!remaining.isEmpty()) {
+        result.add(BaseFile.BaseColumnUpdateDetails.of(remaining, existing.filePath()));
+      }
+    }
+
+    // Add non-overlapping fields from new update
+    List<Integer> newRemaining = Lists.newArrayList(fieldIds);
+    newRemaining.removeAll(overlappingFieldIds);
+    if (!newRemaining.isEmpty()) {
+      result.add(BaseFile.BaseColumnUpdateDetails.of(newRemaining, updateFile.location()));
+    }
 
     return result;
   }

@@ -21,8 +21,10 @@ package org.apache.iceberg.spark.source;
 import java.util.Map;
 import java.util.stream.Stream;
 import org.apache.iceberg.ContentFile;
+import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DataTask;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.ScanTaskGroup;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -75,7 +77,27 @@ class RowDataReader extends BaseRowReader<FileScanTask> implements PartitionRead
 
   @Override
   protected Stream<ContentFile<?>> referencedFiles(FileScanTask task) {
-    return Stream.concat(Stream.of(task.file()), task.deletes().stream());
+    Stream<ContentFile<?>> dataAndDeleteFiles =
+        Stream.concat(Stream.of(task.file()), task.deletes().stream());
+
+    ContentFile<?> baseFile = task.file();
+    if (baseFile.columnUpdateDetails() == null || baseFile.columnUpdateDetails().isEmpty()) {
+      return dataAndDeleteFiles;
+    }
+
+    // TODO gaborkaszab: recordCount? fileSizeInBytes?
+    Stream<ContentFile<?>> columnUpdateFiles =
+        baseFile.columnUpdateDetails().stream()
+            .map(
+                updateDetails ->
+                    DataFiles.builder(PartitionSpec.unpartitioned())
+                        .withPath(updateDetails.filePath())
+                        .withFileSizeInBytes(0)
+                        .withRecordCount(0)
+                        .withEncryptionKeyMetadata(baseFile.keyMetadata())
+                        .build());
+
+    return Stream.concat(dataAndDeleteFiles, columnUpdateFiles);
   }
 
   @Override

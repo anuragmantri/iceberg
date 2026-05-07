@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.source;
 
 import java.util.Map;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.ScanTask;
@@ -70,6 +71,19 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
       Expression residual,
       Map<Integer, ?> idToConstant,
       @Nonnull SparkDeleteFilter deleteFilter) {
+    return newBatchIterable(
+        inputFile, format, start, length, residual, idToConstant, deleteFilter, null);
+  }
+
+  protected CloseableIterable<ColumnarBatch> newBatchIterable(
+      InputFile inputFile,
+      FileFormat format,
+      long start,
+      long length,
+      Expression residual,
+      Map<Integer, ?> idToConstant,
+      @Nonnull SparkDeleteFilter deleteFilter,
+      @Nullable ColumnUpdateStitcher stitcher) {
     Class<? extends ColumnarBatch> readType =
         useComet() ? VectorizedSparkParquetReaders.CometColumnarBatch.class : ColumnarBatch.class;
     ReadBuilder<ColumnarBatch, ?> readBuilder =
@@ -96,11 +110,38 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
             .withNameMapping(nameMapping())
             .build();
 
+    // Apply column update stitching before delete filtering.
+    // Stitching operates in file-position space, so it must precede delete filtering
+    // which may remap row indices via ColumnVectorWithFilter.
+    if (stitcher != null) {
+      BatchColumnUpdateTransform updateTransform = new BatchColumnUpdateTransform(stitcher);
+      iterable = CloseableIterable.transform(iterable, updateTransform::apply);
+    }
+
     return CloseableIterable.transform(iterable, new BatchDeleteFilter(deleteFilter)::filterBatch);
   }
 
   private boolean useComet() {
     return parquetConf != null && parquetConf.readerType() == ParquetReaderType.COMET;
+  }
+
+  /**
+   * Stateful transform that applies column update stitching to each batch, tracking the current
+   * position within the base file across sequential batch reads.
+   */
+  static class BatchColumnUpdateTransform {
+    private final ColumnUpdateStitcher stitcher;
+    private long currentPos = 0;
+
+    BatchColumnUpdateTransform(ColumnUpdateStitcher stitcher) {
+      this.stitcher = stitcher;
+    }
+
+    ColumnarBatch apply(ColumnarBatch batch) {
+      ColumnarBatch result = stitcher.stitch(batch, currentPos);
+      currentPos += batch.numRows();
+      return result;
+    }
   }
 
   @VisibleForTesting

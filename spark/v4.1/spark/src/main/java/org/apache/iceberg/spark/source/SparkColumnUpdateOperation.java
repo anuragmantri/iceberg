@@ -29,23 +29,24 @@ import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.write.DeltaWriteBuilder;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.RowLevelOperationInfo;
-import org.apache.spark.sql.connector.write.WriteBuilder;
+import org.apache.spark.sql.connector.write.SupportsDelta;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-class SparkColumnUpdateOperation extends SparkCopyOnWriteOperation {
+class SparkColumnUpdateOperation implements SupportsDelta {
 
-  // TODO gaborkaszab: add protected getters in the base class, and remove these
   private final SparkSession spark;
   private final Table table;
   private final String branch;
   private final IsolationLevel isolationLevel;
+  private final NamedReference[] updatedColumns;
 
   // lazy vars
   private ScanBuilder lazyScanBuilder;
   private Scan configuredScan;
-  private WriteBuilder lazyWriteBuilder;
+  private DeltaWriteBuilder lazyWriteBuilder;
 
   SparkColumnUpdateOperation(
       SparkSession spark,
@@ -53,11 +54,16 @@ class SparkColumnUpdateOperation extends SparkCopyOnWriteOperation {
       String branch,
       RowLevelOperationInfo info,
       IsolationLevel isolationLevel) {
-    super(spark, table, branch, info, isolationLevel);
     this.spark = spark;
     this.table = table;
     this.branch = branch;
     this.isolationLevel = isolationLevel;
+    this.updatedColumns = info.updatedColumns();
+  }
+
+  @Override
+  public Command command() {
+    return Command.UPDATE;
   }
 
   @Override
@@ -67,42 +73,55 @@ class SparkColumnUpdateOperation extends SparkCopyOnWriteOperation {
           new SparkScanBuilder(spark, table, branch, options) {
             @Override
             public Scan build() {
-              Scan scan = super.buildColumnUpdateScan();
+              Scan scan = super.buildMergeOnReadScan();
               SparkColumnUpdateOperation.this.configuredScan = scan;
               return scan;
             }
           };
     }
-
     return lazyScanBuilder;
   }
 
   @Override
-  public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
+  public DeltaWriteBuilder newWriteBuilder(LogicalWriteInfo info) {
     if (lazyWriteBuilder == null) {
       lazyWriteBuilder =
-          new SparkColumnUpdateWriteBuilder(
-              spark, configuredScan, table, branch, info, isolationLevel);
+          new SparkColumnUpdateWriteBuilder(spark, table, branch, info, isolationLevel);
     }
-
     return lazyWriteBuilder;
   }
 
-  // TODO gaborkaszab: revise what metadata cols are needed.
-  // Row lineage won't be needed in column update files, currently SparkWriter creation fails if I
-  // don't add them. Maybe create a different writer than in SparkCopyOnWriteOperation?
+  @Override
+  public NamedReference[] rowId() {
+    return new NamedReference[] {
+      Expressions.column(MetadataColumns.FILE_PATH.name()),
+      Expressions.column(MetadataColumns.ROW_POSITION.name())
+    };
+  }
+
+  @Override
+  public boolean representUpdateAsDeleteAndInsert() {
+    return false;
+  }
+
+  @Override
+  public boolean supportsColumnUpdates() {
+    return true;
+  }
+
+  @Override
+  public NamedReference[] requiredDataAttributes() {
+    return updatedColumns;
+  }
+
   @Override
   public NamedReference[] requiredMetadataAttributes() {
     List<NamedReference> metadataAttributes = Lists.newArrayList();
-    metadataAttributes.add(Expressions.column(MetadataColumns.FILE_PATH.name()));
-    metadataAttributes.add(Expressions.column(MetadataColumns.ROW_POSITION.name()));
-
     if (TableUtil.supportsRowLineage(table)) {
       metadataAttributes.add(Expressions.column(MetadataColumns.ROW_ID.name()));
       metadataAttributes.add(
           Expressions.column(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name()));
     }
-
     return metadataAttributes.toArray(NamedReference[]::new);
   }
 }

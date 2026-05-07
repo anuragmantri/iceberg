@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 import org.apache.iceberg.ContentFile;
@@ -109,6 +110,15 @@ class BatchDataReader extends BaseBatchReader<FileScanTask>
 
     Map<Integer, ?> idToConstant = constantsMap(task, deleteFilter.requiredSchema());
 
+    // Build stitcher if this file has column updates
+    ColumnUpdateStitcher stitcher = null;
+    List<ContentFile.ColumnUpdateDetails> columnUpdates = task.file().columnUpdateDetails();
+    if (columnUpdates != null && !columnUpdates.isEmpty()) {
+      stitcher =
+          new ColumnUpdateStitcher(
+              expectedSchema(), columnUpdates, path -> table().io().newInputFile(path));
+    }
+
     return newBatchIterable(
             inputFile,
             task.file().format(),
@@ -116,7 +126,8 @@ class BatchDataReader extends BaseBatchReader<FileScanTask>
             task.length(),
             task.residual(),
             idToConstant,
-            deleteFilter)
+            deleteFilter,
+            stitcher)
         .iterator();
   }
 }
